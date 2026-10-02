@@ -15,9 +15,10 @@ import os
 import re
 import struct
 import time
+from collections import deque
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -25,7 +26,6 @@ from typing import Any, Literal
 import requests
 import torch
 from safetensors import safe_open
-
 from vllm.distributed.weight_transfer import (
     HTTPVLLMWeightSyncClient,
     ParamMeta,
@@ -37,6 +37,7 @@ from vllm.distributed.weight_transfer.nccl_engine import (
     NCCLWeightTransferUpdateInfo,
 )
 from vllm.distributed.weight_transfer.packed_tensor import (
+    DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     packed_nccl_broadcast_producer,
 )
 from vllm.utils.network_utils import get_ip, get_open_port
@@ -57,9 +58,11 @@ _SAFETENSORS_DTYPE_TO_TORCH = {
     "F64": (torch.float64, 8),
     "F8_E4M3": (torch.float8_e4m3fn, 1),
     "F8_E5M2": (torch.float8_e5m2, 1),
+    "F8_E8M0": (torch.float8_e8m0fnu, 1),
 }
 
-ExpertTensorOrder = Literal["natural", "lexical"]
+ExpertTensorOrder = Literal["natural", "lexical", "physical"]
+NonexpertTensorOrder = Literal["natural", "physical"]
 
 
 @dataclass(frozen=True)
@@ -70,7 +73,7 @@ class TensorMetadata:
     safetensors_dtype: str
     nbytes: int
     # Absolute byte offsets in the safetensors file. These are internal source
-    # metadata used only by the direct file-backed expert transfer path.
+    # metadata used by direct file-backed transfer paths.
     file_data_offsets: tuple[int, int] | None = None
 
 
@@ -93,6 +96,7 @@ class CheckpointManifest:
     total_bytes: int
     manifest_sha256: str
     expert_tensor_order: ExpertTensorOrder = "natural"
+    nonexpert_tensor_order: NonexpertTensorOrder = "natural"
 
     @classmethod
     def load(
@@ -102,9 +106,13 @@ class CheckpointManifest:
         revision: str,
         checkpoint_path: str | None = None,
         expert_tensor_order: ExpertTensorOrder = "natural",
+        nonexpert_tensor_order: NonexpertTensorOrder = "natural",
     ) -> CheckpointManifest:
         root = _resolve_checkpoint(model, revision, checkpoint_path)
-        tensor_entries = _checkpoint_tensor_entries(root, expert_tensor_order)
+        tensor_entries = _checkpoint_tensor_entries(
+            root,
+            "natural" if expert_tensor_order == "physical" else expert_tensor_order,
+        )
         tensors: list[TensorMetadata] = []
         with ExitStack() as stack:
             opened_files: dict[str, Any] = {}
@@ -124,7 +132,7 @@ class CheckpointManifest:
                 tensor_slice = opened_files[file_name].get_slice(name)
                 dtype_name = tensor_slice.get_dtype()
                 try:
-                    torch_dtype, itemsize = _SAFETENSORS_DTYPE_TO_TORCH[dtype_name]
+                    _, itemsize = _SAFETENSORS_DTYPE_TO_TORCH[dtype_name]
                 except KeyError as exc:
                     raise ValueError(
                         f"Unsupported safetensors dtype {dtype_name!r} for {name}"
@@ -144,6 +152,9 @@ class CheckpointManifest:
                     )
                 )
 
+        tensors = _order_tensor_metadata(
+            tensors, expert_tensor_order, nonexpert_tensor_order
+        )
         manifest_sha256 = _manifest_sha256(tensors)
         return cls(
             model=model,
@@ -154,12 +165,18 @@ class CheckpointManifest:
             total_bytes=sum(tensor.nbytes for tensor in tensors),
             manifest_sha256=manifest_sha256,
             expert_tensor_order=expert_tensor_order,
+            nonexpert_tensor_order=nonexpert_tensor_order,
         )
 
     def iter_cuda_tensors(
-        self, device: torch.device
+        self,
+        device: torch.device,
+        large_tensor_chunk_bytes: int = 0,
+        large_tensor_read_workers: int = 1,
     ) -> Iterator[tuple[str, torch.Tensor]]:
-        return _CheckpointTensorIterator(self, device)
+        return _CheckpointTensorIterator(
+            self, device, large_tensor_chunk_bytes, large_tensor_read_workers
+        )
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -170,15 +187,24 @@ class CheckpointManifest:
             "total_bytes": self.total_bytes,
             "manifest_sha256": self.manifest_sha256,
             "expert_tensor_order": self.expert_tensor_order,
+            "nonexpert_tensor_order": self.nonexpert_tensor_order,
         }
 
 
 class SafetensorsCheckpointSource(WeightSource):
     """Re-iterable, bounded-host-memory source for one immutable checkpoint."""
 
-    def __init__(self, manifest: CheckpointManifest, device: torch.device) -> None:
+    def __init__(
+        self,
+        manifest: CheckpointManifest,
+        device: torch.device,
+        large_tensor_chunk_bytes: int = 0,
+        large_tensor_read_workers: int = 1,
+    ) -> None:
         self.manifest = manifest
         self.device = device
+        self.large_tensor_chunk_bytes = large_tensor_chunk_bytes
+        self.large_tensor_read_workers = large_tensor_read_workers
 
     def metadata(self) -> list[ParamMeta]:
         return [
@@ -191,17 +217,31 @@ class SafetensorsCheckpointSource(WeightSource):
         ]
 
     def __iter__(self) -> Iterator[tuple[str, torch.Tensor]]:
-        return self.manifest.iter_cuda_tensors(self.device)
+        return self.manifest.iter_cuda_tensors(
+            self.device,
+            self.large_tensor_chunk_bytes,
+            self.large_tensor_read_workers,
+        )
 
 
 class _CheckpointTensorIterator(Iterator[tuple[str, torch.Tensor]]):
     """Stream checkpoint tensors while allowing bounded mmap lifetimes."""
 
-    def __init__(self, manifest: CheckpointManifest, device: torch.device) -> None:
+    def __init__(
+        self,
+        manifest: CheckpointManifest,
+        device: torch.device,
+        large_tensor_chunk_bytes: int = 0,
+        large_tensor_read_workers: int = 1,
+    ) -> None:
         self._root = Path(manifest.checkpoint_path)
         self._metadata = tuple(manifest.tensors)
         self._metadata_index = 0
         self._device = device
+        self._large_tensor_chunk_bytes = large_tensor_chunk_bytes
+        if large_tensor_read_workers < 1:
+            raise ValueError("large tensor read workers must be positive")
+        self._large_tensor_read_workers = large_tensor_read_workers
         self._stack = ExitStack()
         self._opened_files: dict[str, Any] = {}
         self._mapped_files: dict[str, tuple[Any, mmap.mmap]] = {}
@@ -229,6 +269,13 @@ class _CheckpointTensorIterator(Iterator[tuple[str, torch.Tensor]]):
             raise StopIteration
         metadata = self._metadata[self._metadata_index]
         self._metadata_index += 1
+
+        if (
+            self._device.type == "cuda"
+            and self._large_tensor_chunk_bytes > 0
+            and metadata.nbytes > self._large_tensor_chunk_bytes
+        ):
+            return metadata.name, self._stream_large_tensor(metadata)
 
         opened_file = self._opened_files.get(metadata.file)
         if opened_file is None:
@@ -265,13 +312,116 @@ class _CheckpointTensorIterator(Iterator[tuple[str, torch.Tensor]]):
         del cpu_tensor
         return metadata.name, cuda_tensor
 
-    def materialize_contiguous_expert(
+    def _stream_large_tensor(self, metadata: TensorMetadata) -> torch.Tensor:
+        """Bound host residency for tensors larger than a transfer chunk."""
+        offsets = metadata.file_data_offsets
+        if offsets is None or offsets[1] - offsets[0] != metadata.nbytes:
+            raise ValueError(f"Invalid safetensors offsets for {metadata.name!r}")
+        device_bytes = torch.empty(
+            metadata.nbytes, dtype=torch.uint8, device=self._device
+        )
+        chunk_bytes = self._large_tensor_chunk_bytes
+        file_handle = (self._root / metadata.file).open("rb", buffering=0)
+        try:
+            ranges = (
+                (position, min(chunk_bytes, metadata.nbytes - position))
+                for position in range(0, metadata.nbytes, chunk_bytes)
+            )
+
+            def read_chunk(position: int, count: int) -> tuple[bytearray, float]:
+                host_buffer = bytearray(count)
+                host_view = memoryview(host_buffer)
+                read_started = time.perf_counter()
+                filled = 0
+                while filled < count:
+                    if self._large_tensor_read_workers == 1:
+                        read = file_handle.readinto(host_view[filled:])
+                    else:
+                        read = os.preadv(
+                            file_handle.fileno(),
+                            [host_view[filled:]],
+                            offsets[0] + position + filled,
+                        )
+                    if not read:
+                        raise EOFError(f"Truncated safetensors data for {metadata.name!r}")
+                    filled += read
+                return host_buffer, time.perf_counter() - read_started
+
+            def buffered_chunks() -> Iterator[tuple[int, int, bytearray, float]]:
+                if self._large_tensor_read_workers == 1:
+                    file_handle.seek(offsets[0])
+                    for position, count in ranges:
+                        host_buffer, read_seconds = read_chunk(position, count)
+                        yield position, count, host_buffer, read_seconds
+                    return
+                with ThreadPoolExecutor(
+                    max_workers=self._large_tensor_read_workers
+                ) as executor:
+                    pending = deque()
+                    for _ in range(self._large_tensor_read_workers):
+                        next_range = next(ranges, None)
+                        if next_range is None:
+                            break
+                        position, count = next_range
+                        pending.append(
+                            (position, count, executor.submit(read_chunk, position, count))
+                        )
+                    while pending:
+                        position, count, future = pending.popleft()
+                        host_buffer, read_seconds = future.result()
+                        yield position, count, host_buffer, read_seconds
+                        next_range = next(ranges, None)
+                        if next_range is not None:
+                            next_position, next_count = next_range
+                            pending.append(
+                                (
+                                    next_position,
+                                    next_count,
+                                    executor.submit(
+                                        read_chunk, next_position, next_count
+                                    ),
+                                )
+                            )
+
+            with closing(buffered_chunks()) as chunks:
+                for position, count, host_buffer, read_seconds in chunks:
+                    self._timing_get_tensor_seconds += read_seconds
+                    cpu_chunk = torch.frombuffer(
+                        host_buffer, dtype=torch.uint8, count=count
+                    )
+                    copy_started = time.perf_counter()
+                    device_bytes[position : position + count].copy_(cpu_chunk)
+                    # Only wait for this source thread's copy stream. A
+                    # simultaneous NCCL broadcast may be running on another
+                    # stream when the next bucket is prefetched.
+                    torch.cuda.current_stream(self._device).synchronize()
+                    self._timing_to_device_seconds += time.perf_counter() - copy_started
+                    del cpu_chunk, host_buffer
+                    if hasattr(os, "posix_fadvise"):
+                        # These pages no longer need to displace offloaded weights.
+                        os.posix_fadvise(
+                            file_handle.fileno(),
+                            offsets[0] + position,
+                            count,
+                            os.POSIX_FADV_DONTNEED,
+                        )
+                    self._timing_h2d_copy_count += 1
+        finally:
+            file_handle.close()
+        self._timing_tensor_count += 1
+        self._timing_total_bytes += metadata.nbytes
+        self._timing_h2d_modes.add("streamed-file")
+        self._timing_files.add(metadata.file)
+        dtype = _SAFETENSORS_DTYPE_TO_TORCH[metadata.safetensors_dtype][0]
+        return device_bytes.view(dtype).view(metadata.shape)
+
+    def materialize_contiguous_bucket(
         self,
         bucket: WeightTransferBucket,
         device: torch.device,
     ) -> list[tuple[str, torch.Tensor]] | None:
-        """Map a physically contiguous expert layer and copy it once."""
-        if device.type != "cuda" or bucket.phase != "expert":
+        """Copy adjacent safetensors payload once and return named GPU views."""
+        if device.type != "cuda":
             return None
         count = len(bucket.metadata)
         current = self._metadata[
@@ -280,58 +430,69 @@ class _CheckpointTensorIterator(Iterator[tuple[str, torch.Tensor]]):
         if len(current) != count or [
             item.name for item in current
         ] != [item.name for item in bucket.metadata]:
-            raise ValueError("Direct expert source order does not match manifest")
+            raise ValueError("Direct source order does not match manifest")
         if not current or any(item.file_data_offsets is None for item in current):
             return None
-        file_name = current[0].file
-        if any(item.file != file_name for item in current):
-            return None
-        offsets = [
-            item.file_data_offsets for item in current
-        ]
-        assert all(offset is not None for offset in offsets)
-        concrete_offsets = [
-            (offset[0], offset[1]) for offset in offsets if offset is not None
-        ]
-        if any(
-            concrete_offsets[index][1]
-            != concrete_offsets[index + 1][0]
-            for index in range(len(concrete_offsets) - 1)
-        ):
-            return None
-
-        self._metadata_index += count
-        _, mapped = self._mapped_file(file_name)
-        first_offset = concrete_offsets[0][0]
-        last_offset = concrete_offsets[-1][1]
-        span = last_offset - first_offset
-        cpu_span = torch.frombuffer(
-            mapped,
-            dtype=torch.uint8,
-            count=span,
-            offset=first_offset,
-        )
-        to_device_started = time.perf_counter()
-        device_span = cpu_span.to(device=device)
-        to_device_seconds = time.perf_counter() - to_device_started
-
-        byte_views = torch.split(
-            device_span,
-            [end - start for start, end in concrete_offsets],
-        )
         named_tensors: list[tuple[str, torch.Tensor]] = []
-        for item, view in zip(current, byte_views):
-            dtype = _SAFETENSORS_DTYPE_TO_TORCH[item.safetensors_dtype][0]
-            named_tensors.append(
-                (item.name, view.view(dtype).view(item.shape))
-            )
-        self._record_direct_timing(
-            file_name=file_name,
-            tensor_count=count,
-            total_bytes=span,
-            to_device_seconds=to_device_seconds,
-        )
+        for segment in _contiguous_file_segments(current):
+            file_name = segment[0].file
+            first_offset = segment[0].file_data_offsets
+            last_offset = segment[-1].file_data_offsets
+            assert first_offset is not None and last_offset is not None
+            span = last_offset[1] - first_offset[0]
+            if self._large_tensor_chunk_bytes > 0 and span > self._large_tensor_chunk_bytes:
+                # Keep the same named tensor views while prefetching a large
+                # physical span with the bounded file reader.
+                span_metadata = TensorMetadata(
+                    name=segment[0].name,
+                    file=file_name,
+                    shape=[span],
+                    safetensors_dtype="U8",
+                    nbytes=span,
+                    file_data_offsets=(first_offset[0], last_offset[1]),
+                )
+                device_span = self._stream_large_tensor(span_metadata)
+                if self._timing_enabled:
+                    self._timing_tensor_count += len(segment) - 1
+                    self._timing_h2d_modes.add(f"streamed-file-{bucket.phase}")
+            else:
+                _, mapped = self._mapped_file(file_name)
+                cpu_span = torch.frombuffer(
+                    mapped,
+                    dtype=torch.uint8,
+                    count=span,
+                    offset=first_offset[0],
+                )
+                to_device_started = time.perf_counter()
+                device_span = cpu_span.to(device=device)
+                to_device_seconds = time.perf_counter() - to_device_started
+                self._record_direct_timing(
+                    file_name=file_name,
+                    tensor_count=len(segment),
+                    total_bytes=span,
+                    to_device_seconds=to_device_seconds,
+                    mode=f"direct-file-{bucket.phase}",
+                )
+            byte_views = torch.split(device_span, [item.nbytes for item in segment])
+            for item, view in zip(segment, byte_views):
+                dtype, itemsize = _SAFETENSORS_DTYPE_TO_TORCH[
+                    item.safetensors_dtype
+                ]
+                if view.storage_offset() % itemsize:
+                    # A mixed-dtype file need not align each view to the next dtype.
+                    view = view.clone()
+                named_tensors.append((item.name, view.view(dtype).view(item.shape)))
+        self._metadata_index += count
         return named_tensors
+
+    def materialize_contiguous_expert(
+        self,
+        bucket: WeightTransferBucket,
+        device: torch.device,
+    ) -> list[tuple[str, torch.Tensor]] | None:
+        if bucket.phase != "expert":
+            return None
+        return self.materialize_contiguous_bucket(bucket, device)
 
     def _mapped_file(self, file_name: str) -> tuple[Any, mmap.mmap]:
         existing = self._mapped_files.get(file_name)
@@ -349,6 +510,7 @@ class _CheckpointTensorIterator(Iterator[tuple[str, torch.Tensor]]):
         tensor_count: int,
         total_bytes: int,
         to_device_seconds: float,
+        mode: str,
     ) -> None:
         if not self._timing_enabled:
             return
@@ -356,7 +518,7 @@ class _CheckpointTensorIterator(Iterator[tuple[str, torch.Tensor]]):
         self._timing_total_bytes += total_bytes
         self._timing_to_device_seconds += to_device_seconds
         self._timing_h2d_copy_count += 1
-        self._timing_h2d_modes.add("direct-file-expert")
+        self._timing_h2d_modes.add(mode)
         self._timing_files.add(file_name)
 
     def record_transfer_timing(
@@ -403,6 +565,11 @@ class _CheckpointTensorIterator(Iterator[tuple[str, torch.Tensor]]):
         """Release file-backed mappings without resetting iteration state."""
         if self._closed:
             return
+        files_to_reclaim = (
+            set(self._opened_files) | set(self._mapped_files)
+            if self._large_tensor_chunk_bytes > 0
+            else set()
+        )
         self._stack.close()
         self._stack = ExitStack()
         self._opened_files.clear()
@@ -410,6 +577,12 @@ class _CheckpointTensorIterator(Iterator[tuple[str, torch.Tensor]]):
             mapped.close()
             file_handle.close()
         self._mapped_files.clear()
+        if hasattr(os, "posix_fadvise"):
+            for file_name in files_to_reclaim:
+                with (self._root / file_name).open("rb") as file_handle:
+                    os.posix_fadvise(
+                        file_handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED
+                    )
 
     def close(self) -> None:
         if self._closed:
@@ -492,6 +665,10 @@ class NcclCheckpointPublisher:
         device: str,
         update_bucket_size_bytes: int = 512 * 1024**2,
         direct_file_expert_h2d: bool = False,
+        direct_file_h2d: bool = False,
+        large_tensor_chunk_bytes: int = 0,
+        large_tensor_read_workers: int = 1,
+        prefetch_max_bucket_bytes: int = 0,
         timeout_seconds: int = 600,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -499,6 +676,14 @@ class NcclCheckpointPublisher:
         self.device = torch.device(device)
         self.update_bucket_size_bytes = update_bucket_size_bytes
         self.direct_file_expert_h2d = direct_file_expert_h2d
+        self.direct_file_h2d = direct_file_h2d
+        self.large_tensor_chunk_bytes = large_tensor_chunk_bytes
+        if large_tensor_read_workers < 1:
+            raise ValueError("large tensor read workers must be positive")
+        self.large_tensor_read_workers = large_tensor_read_workers
+        if prefetch_max_bucket_bytes < 0:
+            raise ValueError("prefetch max bucket bytes must be nonnegative")
+        self.prefetch_max_bucket_bytes = prefetch_max_bucket_bytes
         self.timeout_seconds = timeout_seconds
         self.group = None
         self.client: _TargetWeightSyncClient | None = None
@@ -560,18 +745,23 @@ class NcclCheckpointPublisher:
         transfer_manifest = manifest or self.manifest
         source_device = (
             torch.device("cpu")
-            if self.direct_file_expert_h2d
+            if (self.direct_file_expert_h2d or self.direct_file_h2d)
+            and self.large_tensor_chunk_bytes == 0
             else self.device
         )
         source = SafetensorsCheckpointSource(
             transfer_manifest,
             source_device,
+            self.large_tensor_chunk_bytes,
+            self.large_tensor_read_workers,
         )
         weight_epoch = self.weight_epoch + 1 if target == "main" else self.weight_epoch
         self.client.set_target(target)
         with torch.inference_mode():
             bucket_results = self._send_weights(source)
+        sync_started = time.perf_counter()
         torch.cuda.synchronize(self.device)
+        sync_seconds = time.perf_counter() - sync_started
         self.update_version += 1
         self.weight_epoch = weight_epoch
         return {
@@ -581,7 +771,12 @@ class NcclCheckpointPublisher:
             "send_weights_completed": True,
             "update_bucket_size_bytes": self.update_bucket_size_bytes,
             "direct_file_expert_h2d": self.direct_file_expert_h2d,
+            "direct_file_h2d": self.direct_file_h2d,
+            "large_tensor_chunk_bytes": self.large_tensor_chunk_bytes,
+            "large_tensor_read_workers": self.large_tensor_read_workers,
+            "prefetch_max_bucket_bytes": self.prefetch_max_bucket_bytes,
             "transport_mode": "packed",
+            "post_transfer_sync_seconds": sync_seconds,
             "buckets": bucket_results,
             **transfer_manifest.summary(),
         }
@@ -611,6 +806,7 @@ class NcclCheckpointPublisher:
             source_metadata,
             self.update_bucket_size_bytes,
         )
+        _validate_glm5_fp8_pair_buckets(source.manifest, buckets)
         bucket_build_seconds = time.perf_counter() - bucket_build_started
         transfer_names = [
             item.name for bucket in buckets for item in bucket.metadata
@@ -625,68 +821,45 @@ class NcclCheckpointPublisher:
         bucket_results: list[dict[str, Any]] = []
         sent_names: list[str] = []
         sent_total_bytes = 0
+        start_started = time.perf_counter()
         self.client.start_weight_update()
+        start_seconds = time.perf_counter() - start_started
         update_failed = False
-        try:
-            for index, bucket in enumerate(buckets):
-                bucket_started = time.perf_counter()
-                named_tensors, materialize_seconds = _materialize_bucket_for_device(
-                    source_iter,
-                    bucket,
-                    self.device,
-                    direct_file_expert_h2d=self.direct_file_expert_h2d,
-                )
-                drain_timing = getattr(source_iter, "drain_timing", None)
-                source_timing = drain_timing() if drain_timing is not None else {}
-                update_info = NCCLWeightTransferUpdateInfo(
-                    names=[name for name, _ in named_tensors],
-                    dtype_names=[
-                        str(tensor.dtype).removeprefix("torch.")
-                        for _, tensor in named_tensors
-                    ],
-                    shapes=[list(tensor.shape) for _, tensor in named_tensors],
-                )
-                rpc_started = time.perf_counter()
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(
-                        self.client.update_weights,
-                        asdict(update_info),
-                    )
-                    if future.done():
-                        future.result()
-                    packed_nccl_broadcast_producer(
-                        iterator=iter(named_tensors),
-                        group=group,
-                        src=0,
-                        post_iter_func=lambda item: item[1],
-                    )
-                    future.result()
-                rpc_seconds = time.perf_counter() - rpc_started
-                bucket_seconds = time.perf_counter() - bucket_started
 
-                bucket_results.append(
-                    {
-                        "index": index,
-                        "phase": bucket.phase,
-                        "tensor_count": len(named_tensors),
-                        "total_bytes": bucket.total_bytes,
-                        "materialize_seconds": materialize_seconds,
-                        "rpc_and_nccl_seconds": rpc_seconds,
-                        "total_seconds": bucket_seconds,
-                        "throughput_gib_per_second": (
-                            bucket.total_bytes / 1024**3 / bucket_seconds
-                            if bucket_seconds > 0
-                            else 0.0
-                        ),
-                        **source_timing,
-                    }
+        def materialize_one(bucket: WeightTransferBucket):
+            named_tensors, materialize_seconds = _materialize_bucket_for_device(
+                source_iter,
+                bucket,
+                self.device,
+                direct_file_expert_h2d=self.direct_file_expert_h2d,
+                direct_file_h2d=self.direct_file_h2d,
+            )
+            drain_timing = getattr(source_iter, "drain_timing", None)
+            source_timing = drain_timing() if drain_timing is not None else {}
+            close_handles = getattr(source_iter, "close_handles", None)
+            if close_handles is not None:
+                close_handles()
+            return named_tensors, materialize_seconds, source_timing
+
+        try:
+            with closing(
+                _prefetch_materialized_buckets(
+                    buckets, materialize_one, self.prefetch_max_bucket_bytes
                 )
-                sent_names.extend(name for name, _ in named_tensors)
-                sent_total_bytes += bucket.total_bytes
-                del named_tensors
-                close_handles = getattr(source_iter, "close_handles", None)
-                if close_handles is not None:
-                    close_handles()
+            ) as prepared:
+                for index, bucket in enumerate(buckets):
+                    bucket_started = time.perf_counter()
+                    named_tensors, materialize_seconds, source_timing = next(prepared)
+                    source_wait_seconds = time.perf_counter() - bucket_started
+                    bucket_results.append(
+                        self._broadcast_bucket(
+                            index, bucket, named_tensors, materialize_seconds,
+                            source_timing, source_wait_seconds, bucket_started, group,
+                        )
+                    )
+                    sent_names.extend(name for name, _ in named_tensors)
+                    sent_total_bytes += bucket.total_bytes
+                    del named_tensors
 
             try:
                 extra_name, extra_tensor = next(source_iter)
@@ -727,10 +900,71 @@ class NcclCheckpointPublisher:
             bucket_results[0]["_timing_summary"] = {
                 "metadata_seconds": metadata_seconds,
                 "bucket_build_seconds": bucket_build_seconds,
+                "start_rpc_seconds": start_seconds,
                 "finish_rpc_seconds": finish_seconds,
                 "total_seconds": total_seconds,
             }
         return bucket_results
+
+    def _broadcast_bucket(
+        self,
+        index: int,
+        bucket: WeightTransferBucket,
+        named_tensors: list[tuple[str, torch.Tensor]],
+        materialize_seconds: float,
+        source_timing: dict[str, Any],
+        source_wait_seconds: float,
+        bucket_started: float,
+        group: Any,
+    ) -> dict[str, Any]:
+        assert self.client is not None
+        update_info = NCCLWeightTransferUpdateInfo(
+            names=[name for name, _ in named_tensors],
+            dtype_names=[
+                str(tensor.dtype).removeprefix("torch.")
+                for _, tensor in named_tensors
+            ],
+            shapes=[list(tensor.shape) for _, tensor in named_tensors],
+        )
+        rpc_started = time.perf_counter()
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(
+                self.client.update_weights,
+                asdict(update_info),
+            )
+            if future.done():
+                future.result()
+            packed_nccl_broadcast_producer(
+                iterator=iter(named_tensors),
+                group=group,
+                src=0,
+                post_iter_func=lambda item: item[1],
+            )
+            future.result()
+        finally:
+            # The receiver can remain blocked in NCCL when a sender
+            # broadcast fails, so joining its RPC thread can hang here.
+            executor.shutdown(wait=False)
+        rpc_seconds = time.perf_counter() - rpc_started
+        bucket_seconds = time.perf_counter() - bucket_started
+        return {
+            "index": index,
+            "phase": bucket.phase,
+            "tensor_count": len(named_tensors),
+            "total_bytes": bucket.total_bytes,
+            "materialize_seconds": materialize_seconds,
+            "source_wait_seconds": source_wait_seconds,
+            "rpc_and_nccl_seconds": rpc_seconds,
+            # With prefetching, this is critical-path wait plus RPC;
+            # materialize_seconds may overlap the previous bucket's RPC.
+            "total_seconds": bucket_seconds,
+            "throughput_gib_per_second": (
+                bucket.total_bytes / 1024**3 / bucket_seconds
+                if bucket_seconds > 0 else 0.0
+            ),
+            **source_timing,
+        }
 
     def shutdown(self) -> None:
         self.group = None
@@ -814,6 +1048,64 @@ def _expert_parent(name: str) -> str | None:
     if ".experts." not in name:
         return None
     return name.split(".experts.", 1)[0]
+
+
+def _physical_expert_tensor_key(item: TensorMetadata) -> tuple[Any, ...]:
+    parent = _expert_parent(item.name)
+    if parent is None:
+        return (0, _natural_name_key(item.name))
+    if item.file_data_offsets is None:
+        raise ValueError(f"Missing safetensors offset for {item.name!r}")
+    return (
+        1,
+        _natural_name_key(parent),
+        item.file,
+        item.file_data_offsets[0],
+    )
+
+
+def _order_tensor_metadata(
+    tensors: list[TensorMetadata],
+    expert_order: ExpertTensorOrder,
+    nonexpert_order: NonexpertTensorOrder,
+) -> list[TensorMetadata]:
+    """Keep expert layers grouped while optionally following file layout."""
+    nonexpert = [item for item in tensors if _expert_parent(item.name) is None]
+    expert = [item for item in tensors if _expert_parent(item.name) is not None]
+    if nonexpert_order == "physical":
+        if any(item.file_data_offsets is None for item in nonexpert):
+            raise ValueError("Physical nonexpert order requires safetensors offsets")
+        nonexpert.sort(
+            key=lambda item: (item.file, item.file_data_offsets[0], item.name)
+        )
+    elif nonexpert_order != "natural":
+        raise ValueError(f"Unknown nonexpert tensor order: {nonexpert_order}")
+    if expert_order == "physical":
+        expert.sort(key=_physical_expert_tensor_key)
+    return nonexpert + expert
+
+
+def _contiguous_file_segments(
+    tensors: tuple[TensorMetadata, ...],
+) -> list[tuple[TensorMetadata, ...]]:
+    """Partition ordered tensors at file boundaries and payload gaps."""
+    segments: list[tuple[TensorMetadata, ...]] = []
+    current: list[TensorMetadata] = []
+    for item in tensors:
+        offsets = item.file_data_offsets
+        if offsets is None or offsets[1] - offsets[0] != item.nbytes:
+            raise ValueError(f"Invalid safetensors offsets for {item.name!r}")
+        if current:
+            previous = current[-1]
+            previous_offsets = previous.file_data_offsets
+            assert previous_offsets is not None
+            if item.file != previous.file or offsets[0] != previous_offsets[1]:
+                segments.append(tuple(current))
+                current = []
+        current.append(item)
+    if current:
+        segments.append(tuple(current))
+    return segments
 
 
 def _vime_transfer_name_key(
@@ -925,6 +1217,71 @@ def _build_vime_transfer_buckets(
     return buckets
 
 
+def _validate_glm5_fp8_pair_buckets(
+    manifest: CheckpointManifest,
+    buckets: list[WeightTransferBucket],
+) -> None:
+    """Reject an ordering that separates GLM's FP8 weight and scale.
+
+    Glm5Next buffers these pairs only within one ``model.load_weights`` call.
+    The NCCL consumer invokes that method once per packed buffer, so a pair
+    spanning buckets (or a bucket that may itself be packed in parts) can
+    silently leave a BF16 projection stale.
+    """
+    config_path = Path(manifest.checkpoint_path) / "config.json"
+    if not config_path.is_file():
+        return
+    config = json.loads(config_path.read_text())
+    if not any(
+        architecture.startswith("Glm5Next")
+        for architecture in config.get("architectures", [])
+    ):
+        return
+
+    locations = {
+        item.name: bucket_index
+        for bucket_index, bucket in enumerate(buckets)
+        for item in bucket.metadata
+    }
+    projections = (
+        ".self_attn.q_a_proj.",
+        ".self_attn.kv_a_proj_with_mqa.",
+        ".self_attn.q_b_proj.",
+        ".self_attn.o_proj.",
+        ".self_attn.wk.",
+    )
+    split = []
+    for name, bucket_index in locations.items():
+        if not name.endswith(".weight") or not any(
+            projection in name for projection in projections
+        ):
+            continue
+        scale_name = name[: -len(".weight")] + ".weight_scale_inv"
+        scale_bucket = locations.get(scale_name)
+        if scale_bucket is None:
+            continue
+        if (
+            scale_bucket != bucket_index
+            or buckets[bucket_index].total_bytes > DEFAULT_PACKED_BUFFER_SIZE_BYTES
+        ):
+            split.append(name)
+    if split:
+        raise ValueError(
+            "GLM FP8 projection weight/scale pairs may cross model.load_weights "
+            f"calls ({len(split)} pairs, e.g. {split[:3]}). Use "
+            "--nonexpert-tensor-order natural or smaller transfer buckets."
+        )
+
+
+def validate_manifest_transfer_order(
+    manifest: CheckpointManifest, bucket_size_bytes: int
+) -> None:
+    """Check pair atomicity before opening a receiver NCCL group."""
+    source = SafetensorsCheckpointSource(manifest, torch.device("cpu"))
+    buckets = _build_vime_transfer_buckets(source.metadata(), bucket_size_bytes)
+    _validate_glm5_fp8_pair_buckets(manifest, buckets)
+
+
 def _materialize_bucket(
     source_iter: Iterator[tuple[str, torch.Tensor]],
     bucket: WeightTransferBucket,
@@ -954,21 +1311,52 @@ def _materialize_bucket(
     return named_tensors
 
 
+def _prefetch_materialized_buckets(buckets, materialize_one, max_bucket_bytes):
+    """Yield prepared buckets in order, overlapping only bounded neighbors."""
+    if not max_bucket_bytes:
+        for bucket in buckets:
+            yield materialize_one(bucket)
+        return
+    if not buckets:
+        return
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = None
+        for index, bucket in enumerate(buckets):
+            prepared = (
+                pending.result() if pending is not None else materialize_one(bucket)
+            )
+            next_bucket = buckets[index + 1] if index + 1 < len(buckets) else None
+            if (
+                next_bucket is not None
+                and bucket.total_bytes <= max_bucket_bytes
+                and next_bucket.total_bytes <= max_bucket_bytes
+            ):
+                pending = executor.submit(materialize_one, next_bucket)
+            else:
+                pending = None
+            yield prepared
+
+
 def _materialize_bucket_for_device(
     source_iter: Iterator[tuple[str, torch.Tensor]],
     bucket: WeightTransferBucket,
     device: torch.device,
     *,
     direct_file_expert_h2d: bool = False,
+    direct_file_h2d: bool = False,
 ) -> tuple[list[tuple[str, torch.Tensor]], float]:
     """Materialize one bucket on a worker thread with an explicit CUDA device."""
     if device.type == "cuda":
         torch.cuda.set_device(device)
     started = time.perf_counter()
-    if direct_file_expert_h2d and bucket.phase == "expert":
+    if direct_file_h2d or (direct_file_expert_h2d and bucket.phase == "expert"):
         direct_materialize = getattr(
             source_iter,
-            "materialize_contiguous_expert",
+            (
+                "materialize_contiguous_bucket"
+                if direct_file_h2d
+                else "materialize_contiguous_expert"
+            ),
             None,
         )
         if direct_materialize is not None:

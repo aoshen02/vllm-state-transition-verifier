@@ -17,8 +17,8 @@ update；独立 DraftModel 使用单独的 draft manifest 和 `--enable-draft-up
 | `hf_checkpoint_nccl_publisher.py` | checkpoint manifest、canonical source、stateful NCCL publisher |
 | `run_vllm_weight_update.py` | 只执行一次 checkpoint NCCL weight update 的最小 CLI |
 | `run_vllm_lifecycle.sh` | 一次调用完成 VIME lifecycle 和 publisher 的 shell wrapper |
-| `validation/` | GSM8K、fixed-token oracle 以及更新前后结果比较工具 |
-| `provenance/write_run_sidecars.py` | 为结果目录生成 provenance `.meta.json` |
+| `validation/` | fixed-token oracle 以及更新前后序列比较工具 |
+| `provenance/write_run_sidecars.py` | 为结果目录生成 provenance `.meta.json`；必须用 `--cmd` 给出实际启动命令 |
 
 ## 服务端合同
 

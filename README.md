@@ -22,8 +22,8 @@ Megatron, or Transformers dependency — it talks to vLLM directly.
 | `hf_checkpoint_nccl_publisher.py` | Checkpoint manifest, canonical source, stateful NCCL publisher |
 | `run_vllm_weight_update.py` | Minimal CLI: one checkpoint NCCL weight-update transaction |
 | `run_vllm_lifecycle.sh` | Optional wrapper orchestrating pause / reset / sleep / wake / resume around the publisher |
-| `validation/` | Fixed-token oracle, GSM8K eval, and pre/post comparison |
-| `provenance/write_run_sidecars.py` | Emits `.meta.json` provenance sidecars for a result directory |
+| `validation/` | Fixed-token oracle and pre/post sequence comparison |
+| `provenance/write_run_sidecars.py` | Emits `.meta.json` provenance sidecars for a result directory; `--cmd <launch command>` is required |
 
 Full usage notes are in
 [`scripts/vllm_weight_update_client/README_ZH.md`](scripts/vllm_weight_update_client/README_ZH.md) (Chinese).

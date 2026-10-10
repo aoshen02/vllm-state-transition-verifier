@@ -17,9 +17,7 @@ def main() -> None:
     parser.add_argument("revision")
     parser.add_argument("nodes")
     parser.add_argument("head")
-    parser.add_argument(
-        "--cmd", default="run_qwen36_gsm8k_identity_update_tp1_container.sh"
-    )
+    parser.add_argument("--cmd", required=True)
     parser.add_argument(
         "--image", default="<registry>/dev:vllm-modelb-arm64-cu13-0f0fd91"
     )

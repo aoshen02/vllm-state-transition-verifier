@@ -57,6 +57,7 @@ _SAFETENSORS_DTYPE_TO_TORCH = {
     "F64": (torch.float64, 8),
     "F8_E4M3": (torch.float8_e4m3fn, 1),
     "F8_E5M2": (torch.float8_e5m2, 1),
+    "F8_E8M0": (torch.float8_e8m0fnu, 1),
 }
 
 ExpertTensorOrder = Literal["natural", "lexical"]

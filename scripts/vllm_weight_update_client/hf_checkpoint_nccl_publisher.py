@@ -41,6 +41,8 @@ from vllm.distributed.weight_transfer.packed_tensor import (
 )
 from vllm.utils.network_utils import get_ip, get_open_port
 
+from update_timing import summarize_update_timing
+
 _SAFETENSORS_DTYPE_TO_TORCH = {
     "BOOL": (torch.bool, 1),
     "U8": (torch.uint8, 1),
@@ -570,7 +572,7 @@ class NcclCheckpointPublisher:
         weight_epoch = self.weight_epoch + 1 if target == "main" else self.weight_epoch
         self.client.set_target(target)
         with torch.inference_mode():
-            bucket_results = self._send_weights(source)
+            bucket_results, timing = self._send_weights(source)
         torch.cuda.synchronize(self.device)
         self.update_version += 1
         self.weight_epoch = weight_epoch
@@ -582,6 +584,7 @@ class NcclCheckpointPublisher:
             "update_bucket_size_bytes": self.update_bucket_size_bytes,
             "direct_file_expert_h2d": self.direct_file_expert_h2d,
             "transport_mode": "packed",
+            "timing": timing,
             "buckets": bucket_results,
             **transfer_manifest.summary(),
         }
@@ -589,7 +592,7 @@ class NcclCheckpointPublisher:
     def _send_weights(
         self,
         source: SafetensorsCheckpointSource,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Send one update using the required non-expert/expert order."""
         if self.group is None or self.client is None:
             raise RuntimeError("NCCL publisher has no initialized trainer group")
@@ -625,7 +628,9 @@ class NcclCheckpointPublisher:
         bucket_results: list[dict[str, Any]] = []
         sent_names: list[str] = []
         sent_total_bytes = 0
+        start_rpc_started = time.perf_counter()
         self.client.start_weight_update()
+        start_rpc_seconds = time.perf_counter() - start_rpc_started
         update_failed = False
         try:
             for index, bucket in enumerate(buckets):
@@ -654,14 +659,20 @@ class NcclCheckpointPublisher:
                     )
                     if future.done():
                         future.result()
+                    send_started = time.perf_counter()
                     packed_nccl_broadcast_producer(
                         iterator=iter(named_tensors),
                         group=group,
                         src=0,
                         post_iter_func=lambda item: item[1],
                     )
+                    # The RPC below only returns once the server has received
+                    # this bucket, so waiting for the send here costs nothing.
+                    torch.cuda.synchronize(self.device)
+                    sent = time.perf_counter()
                     future.result()
-                rpc_seconds = time.perf_counter() - rpc_started
+                    returned = time.perf_counter()
+                rpc_seconds = returned - rpc_started
                 bucket_seconds = time.perf_counter() - bucket_started
 
                 bucket_results.append(
@@ -672,6 +683,8 @@ class NcclCheckpointPublisher:
                         "total_bytes": bucket.total_bytes,
                         "materialize_seconds": materialize_seconds,
                         "rpc_and_nccl_seconds": rpc_seconds,
+                        "nccl_send_seconds": sent - send_started,
+                        "server_wait_seconds": returned - sent,
                         "total_seconds": bucket_seconds,
                         "throughput_gib_per_second": (
                             bucket.total_bytes / 1024**3 / bucket_seconds
@@ -723,14 +736,15 @@ class NcclCheckpointPublisher:
                 self.client.finish_weight_update()
             finish_seconds = time.perf_counter() - finish_started
         total_seconds = time.perf_counter() - transfer_started
-        if bucket_results:
-            bucket_results[0]["_timing_summary"] = {
-                "metadata_seconds": metadata_seconds,
-                "bucket_build_seconds": bucket_build_seconds,
-                "finish_rpc_seconds": finish_seconds,
-                "total_seconds": total_seconds,
-            }
-        return bucket_results
+        timing = summarize_update_timing(
+            bucket_results,
+            start_rpc_seconds=start_rpc_seconds,
+            finish_rpc_seconds=finish_seconds,
+            total_seconds=total_seconds,
+        )
+        timing["metadata_seconds"] = metadata_seconds
+        timing["bucket_build_seconds"] = bucket_build_seconds
+        return bucket_results, timing
 
     def shutdown(self) -> None:
         self.group = None

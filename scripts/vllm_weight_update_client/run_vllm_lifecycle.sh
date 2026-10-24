@@ -20,11 +20,22 @@ done
 shift
 [[ $# -gt 0 ]] || { usage; exit 2; }
 
+now() { date +%s.%N; }
+
+# "+ TIMING <step> <seconds>" on stderr, one line per lifecycle step
+timing() {
+  awk -v step="$1" -v t0="$2" -v t1="$(now)" \
+    'BEGIN { printf "+ TIMING %s %.3f\n", step, t1 - t0 }' >&2
+}
+
 post() {
+  local started
+  started=$(now)
   echo "+ POST /$1" >&2
   curl --fail --show-error --silent --max-time "${VLLM_CONTROL_TIMEOUT:-600}" \
     -X POST "$base_url/$1" "${@:2}"
   echo
+  timing "${1%%\?*}" "$started"
 }
 
 wait_until_ready() {
@@ -53,6 +64,7 @@ reset_cache() {
   [[ $reply =~ \"success\"[[:space:]]*:[[:space:]]*true ]]
 }
 
+lifecycle_started=$(now)
 $abort_inflight && post abort_requests -H content-type:application/json -d '{}'
 if $offload; then
   reset_cache
@@ -63,10 +75,14 @@ if $offload; then
 fi
 post "pause?mode=keep&clear_cache=false" -H content-type:application/json -d '{}'
 reset_cache
-rc=0; "$@" || rc=$?
+rc=0; publisher_started=$(now); "$@" || rc=$?
+timing publisher "$publisher_started"
 ((rc == 0)) || { echo "publisher failed; service remains paused" >&2; exit "$rc"; }
 post resume -H content-type:application/json -d '{}'
 if $offload; then
   post "wake_up?tags=kv_cache"
+  ready_started=$(now)
   wait_until_ready
+  timing wait_until_ready "$ready_started"
 fi
+timing lifecycle_total "$lifecycle_started"

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import time
 from pathlib import Path
 
 from hf_checkpoint_nccl_publisher import (
     CheckpointManifest,
     NcclCheckpointPublisher,
 )
+from update_timing import format_timing_table
 
 
 def main() -> None:
@@ -67,12 +70,14 @@ def main() -> None:
             "and --draft-checkpoint-path"
         )
 
+    manifest_started = time.perf_counter()
     manifest = CheckpointManifest.load(
         model=args.model,
         revision=args.revision,
         checkpoint_path=args.checkpoint_path,
         expert_tensor_order=args.expert_tensor_order,
     )
+    manifest_load_seconds = time.perf_counter() - manifest_started
     draft_manifest = None
     if args.enable_draft_update:
         draft_manifest = CheckpointManifest.load(
@@ -90,7 +95,9 @@ def main() -> None:
         timeout_seconds=args.timeout,
     )
     try:
+        initialize_started = time.perf_counter()
         initialization = publisher.initialize()
+        initialize_seconds = time.perf_counter() - initialize_started
         updates = [publisher.publish_update(target="main")]
         if args.enable_mtp:
             updates.append(publisher.publish_update(target="draft"))
@@ -104,8 +111,20 @@ def main() -> None:
     finally:
         publisher.shutdown()
 
+    print(
+        f"manifest load {manifest_load_seconds:.2f} s, "
+        f"initialize (incl. NCCL rendezvous) {initialize_seconds:.2f} s",
+        file=sys.stderr,
+    )
+    for update in updates:
+        print(
+            format_timing_table(update["timing"], title=f"{update['target']} update"),
+            file=sys.stderr,
+        )
     result = {
         "checkpoint": manifest.summary(),
+        "manifest_load_seconds": manifest_load_seconds,
+        "initialize_seconds": initialize_seconds,
         "initialization": initialization,
         "mtp_enabled": args.enable_mtp,
         "independent_draft_enabled": draft_manifest is not None,
